@@ -39,6 +39,9 @@ from nvf.nerfstudio_interface.nbv_dataset import NBVDataset
 
 from nvf.visibility.train_nvf import gen_data, get_balance_weight, get_density_embedding
 from nvf.nerfstudio_interface.nbv_utils import save_init_checkpoint
+from nvf.uncertainty.bayesrays_outputs import get_output_fn
+from nvf.uncertainty.bayesrays_uncertainty import ComputeUncertainty
+
 
 
 CONSOLE = Console(width=120)
@@ -192,7 +195,7 @@ class NBVTrainer(Trainer):
 
         self._init_viewer_state()
         num_iterations = self.config.max_num_iterations
-        # print('max training iteration:', num_iterations)
+        print('max training iteration:', num_iterations)
         step = 0
         for step in range(self._start_step, self._start_step + num_iterations):
             torch.cuda.empty_cache()
@@ -200,21 +203,29 @@ class NBVTrainer(Trainer):
                 time.sleep(0.01)
             with self.train_lock:
                 with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
-                    self.pipeline.train()
+                    if self.pipeline.model.use_bayes_rays:
+                        # Bayes Rays training iteration
+                        loss = self.train_BayesRays_iteration(step)
+                        loss_dict = {"bayes_rays_loss": loss.item()}
+                        metrics_dict = {}
+                    else:
+                        # Default training pipeline
+                        self.pipeline.train()
 
-                    # training callbacks before the training iteration
-                    for callback in self.callbacks:
-                        callback.run_callback_at_location(
-                            step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION
-                        )
-                    # time the forward pass
-                    loss, loss_dict, metrics_dict = self.train_iteration(step)
+                        # Training callbacks before the iteration
+                        for callback in self.callbacks:
+                            callback.run_callback_at_location(
+                                step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION
+                            )
 
-                    # training callbacks after the training iteration
-                    for callback in self.callbacks:
-                        callback.run_callback_at_location(
-                            step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION
-                        )
+                        # Forward pass
+                        loss, loss_dict, metrics_dict = self.train_iteration(step)
+
+                        # Training callbacks after the iteration
+                        for callback in self.callbacks:
+                            callback.run_callback_at_location(
+                                step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION
+                            )
 
             if step > 1:
                     writer.put_time(
@@ -384,6 +395,77 @@ class NBVTrainer(Trainer):
             optimizer.step()
 
         return train_loss.detach()
+    
+    def train_BayesRays_iteration(self, step: int):
+        """
+        Train the Bayes Rays model for one iteration.
+
+        Args:
+            step: Current train step
+        """
+        # Ensure the model is in training mode
+        self.pipeline.model.train()
+
+        # Assign default values for required attributes if they don't exist
+        if not hasattr(self.pipeline.model, 'N'):
+            self.pipeline.model.N = 4096 * 1000  # Default ray dataset size
+        if not hasattr(self.pipeline.model, 'lod'):
+            self.pipeline.model.lod = 8  # Default LOD level
+        if not hasattr(self.pipeline.model, 'hessian'):
+            self.pipeline.model.hessian = torch.zeros(((2**self.pipeline.model.lod) + 1)**3).to(self.device)
+        if not hasattr(self.pipeline.model, 'filter_out'):
+            self.pipeline.model.filter_out = False  # Default: No filtering
+        if not hasattr(self.pipeline.model, 'filter_thresh'):
+            self.pipeline.model.filter_thresh = 0.5  # Default threshold for filtering uncertainty
+        if not hasattr(self.pipeline.model, 'max_uncertainty'):
+            self.pipeline.model.max_uncertainty = 6.0  # Approx upper bound
+        if not hasattr(self.pipeline.model, 'min_uncertainty'):
+            self.pipeline.model.min_uncertainty = -3.0  # Approx lower bound
+
+        if not hasattr(self.pipeline.model, 'get_uncertainty'):
+            from nvf.uncertainty.bayesrays_outputs import get_uncertainty
+            self.pipeline.model.get_uncertainty = get_uncertainty.__get__(self.pipeline.model, type(self.pipeline.model))
+        
+        if not hasattr(self.pipeline.model, 'white_bg'):
+            self.pipeline.model.white_bg = False  # Default: No white background
+        if not hasattr(self.pipeline.model, 'black_bg'):
+            self.pipeline.model.black_bg = False  # Default: No black background
+
+
+
+        # Get the data for the current training step
+        ray_bundle, batch = self.pipeline.datamanager.next_train(step)
+
+        # Compute 3D positions along the rays (if frustums is unavailable)
+        t_vals = torch.linspace(0, 1, steps=128, device=ray_bundle.origins.device)  # Adjust sampling logic
+        points = ray_bundle.origins[:, None, :] + t_vals[:, None] * ray_bundle.directions[:, None, :]
+
+        # Get outputs with uncertainty
+        output_fn = get_output_fn(self.pipeline.model)
+        outputs = output_fn(self.pipeline.model, ray_bundle)
+
+        # Compute uncertainty using gradients
+        offsets = outputs.get("uncertainty", None)
+        aabb = self.pipeline.model.scene_box.aabb.to(self.device)
+        uncertainty_calculator = ComputeUncertainty(load_config=None, aabb=aabb, device=self.device)
+        uncertainty = uncertainty_calculator.find_uncertainty(
+            points, offsets, outputs['rgb'], self.pipeline.model.field.spatial_distortion
+        )
+
+        # Log uncertainty metrics
+        self.log_uncertainty_metrics(uncertainty, step)
+
+        # Combine uncertainty with other losses (e.g., RGB loss, depth loss)
+        rgb_loss = self.calculate_rgb_loss(outputs['rgb'], batch['image'])
+        uncertainty_loss = torch.mean(uncertainty)
+        total_loss = rgb_loss + self.config.uncertainty_weight * uncertainty_loss
+
+        # Backpropagation and optimization
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return total_loss.detach()
 
     
     def train_nvf(self):
@@ -414,8 +496,8 @@ class NBVTrainer(Trainer):
         self.pipeline.model.train_nvf = True
         for i in range(epochs+1):
             train_loss = self.train_var_iteration(i)
-            # if i%100==0:
-            #     print('var', i, train_loss.item())   
+            if i%100==0:
+                print('var', i, train_loss.item())   
         # self.pipeline.model.train_nvf = False   
 
         for i in range(epochs+1):
@@ -431,7 +513,7 @@ class NBVTrainer(Trainer):
                     eval_loss += self.nvf_loss_fn(eval_pred, eval_visibility)
                 eval_loss /= num_batch_eval
 
-                # print('nvf', i, train_loss.item(), eval_loss.item())
+                print('nvf', i, train_loss.item(), eval_loss.item())
         self.pipeline.model.train_nvf = False
         
 

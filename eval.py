@@ -60,6 +60,13 @@ def set_params(cfg, pipeline, planning=True):
         pipeline.trainer.pipeline.model.renderer_entropy.mu = cfg.mu
         pipeline.use_visibility = True
         pipeline.trainer.pipeline.model.use_nvf = True
+    
+    elif cfg.method == 'BayesRays':
+        # Configure Bayes Rays specific parameters
+        pipeline.trainer.pipeline.model.field.use_visibility = False
+        pipeline.trainer.pipeline.model.field.use_rgb_variance = False
+        pipeline.trainer.pipeline.model.field.use_bayes_rays = True
+        pipeline.trainer.pipeline.model.train_bayes_rays = True
 
         
     else:

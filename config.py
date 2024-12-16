@@ -18,6 +18,7 @@ class SamplerType(StrEnum):
 class MethodType(StrEnum):
     nvf = 'NVF' # our method
     wd = 'WeightDist' # Entropy estimation method proposed by Lee 2022 RAL https://arxiv.org/abs/2209.08409
+    bayes_rays = 'BayesRays'
 
 class SceneType(StrEnum):
     hubble = 'HubbleScene'

@@ -173,7 +173,8 @@ class ActiveMapper:
         self,
         images: List[NDArray] = [],
         poses: List = [],
-        model_option: Literal["reinit", "load_ckpt", None] = None
+        model_option: Literal["reinit", "load_ckpt", None] = None,
+        method: str = None
     ) -> None:
         """
         adds new images to datamananager, begins training loop from last checkpoint (assuming toggle_config_model_checkpoint(True) has been called)
@@ -229,6 +230,12 @@ class ActiveMapper:
         # self.trainer.pipeline.model.field.use_visibility = False
         # self.trainer.pipeline.model.use_nvf = False
         # self.trainer.pipeline.model.calculate_entropy = False
+        
+        if method == "BayesRays":
+            self.trainer.pipeline.model.use_bayes_rays = True
+        else:
+            self.trainer.pipeline.model.use_bayes_rays = False
+
         self.trainer.train()
 
         

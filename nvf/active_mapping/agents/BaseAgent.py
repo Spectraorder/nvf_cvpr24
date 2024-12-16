@@ -64,7 +64,7 @@ class BaseAgent():
         if self.step == self.config.horizon-1:
             print('agent last step')
         
-        self.pipeline.add_image(images=obs, poses=prev_poses, model_option=add_image_option)
+        self.pipeline.add_image(images=obs, poses=prev_poses, model_option=add_image_option, method=self.config.method)
         self.current_pose = tensor2pose(prev_poses[-1])
     
     def get_reward(self, poses):
