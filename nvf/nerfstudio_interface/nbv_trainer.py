@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dataclasses import dataclass, field
 from typing import Type
@@ -39,7 +40,6 @@ from nvf.nerfstudio_interface.nbv_dataset import NBVDataset
 
 from nvf.visibility.train_nvf import gen_data, get_balance_weight, get_density_embedding
 from nvf.nerfstudio_interface.nbv_utils import save_init_checkpoint
-from nvf.uncertainty.bayesrays_outputs import get_output_fn
 from nvf.uncertainty.bayesrays_uncertainty import ComputeUncertainty
 
 
@@ -57,6 +57,8 @@ class NBVTrainerConfig(TrainerConfig):
     nvf_batch_size = 65536
     nvf_num_iterations = 500
     nvf_train_batch_repeat = 5
+
+    uncertainty_weight: float = 1.0
 
     """Below methods to allow yaml assignment"""
     def __setitem__(self, key, value):
@@ -184,6 +186,57 @@ class NBVTrainer(Trainer):
         #     )
         #     banner_messages = [f"Viewer at: {self.viewer_state.viewer_url}"]
 
+    def log_uncertainty_metrics(self, uncertainty, step):
+        """
+        Log uncertainty metrics for debugging and analysis.
+
+        Args:
+            uncertainty (torch.Tensor): The computed uncertainty tensor.
+            step (int): The current training step.
+        """
+        # Compute basic statistics for uncertainty
+        mean_uncertainty = torch.mean(uncertainty).item()
+        max_uncertainty = torch.max(uncertainty).item()
+        min_uncertainty = torch.min(uncertainty).item()
+
+        # Log the metrics (use print or writer depending on your setup)
+        print(f"Step {step}: Uncertainty Metrics")
+        print(f"  Mean Uncertainty: {mean_uncertainty:.6f}")
+        print(f"  Max Uncertainty: {max_uncertainty:.6f}")
+        print(f"  Min Uncertainty: {min_uncertainty:.6f}")
+
+        # If you're using a logging writer (e.g., TensorBoard, WandB)
+        writer.put_scalar("Uncertainty/Mean", mean_uncertainty, step)
+        writer.put_scalar("Uncertainty/Max", max_uncertainty, step)
+        writer.put_scalar("Uncertainty/Min", min_uncertainty, step)
+
+    def calculate_rgb_loss(self, predicted_rgb, target_image):
+        """
+        Calculate the RGB loss between predicted and target images.
+
+        Args:
+            predicted_rgb (torch.Tensor): Predicted RGB values, shape [N, 3].
+            target_image (torch.Tensor): Ground truth image values, shape [N, 3].
+
+        Returns:
+            torch.Tensor: Computed RGB loss.
+        """
+        # Move target_image to the same device as predicted_rgb
+        target_image = target_image.to(predicted_rgb.device)
+
+        # Strip the alpha channel from target_image if it exists
+        if target_image.shape[-1] == 4:
+            target_image = target_image[..., :3]  # Keep only the RGB channels
+
+        # Ensure the tensors have the same shape
+        if predicted_rgb.shape != target_image.shape:
+            raise ValueError(f"Shape mismatch: predicted_rgb {predicted_rgb.shape}, target_image {target_image.shape}")
+        
+        # Calculate the Mean Squared Error (MSE) loss
+        loss = F.mse_loss(predicted_rgb, target_image)
+        
+        return loss
+    
     def train(self):
         """Train the model."""
 
@@ -436,34 +489,37 @@ class NBVTrainer(Trainer):
         # Get the data for the current training step
         ray_bundle, batch = self.pipeline.datamanager.next_train(step)
 
-        # Compute 3D positions along the rays (if frustums is unavailable)
-        t_vals = torch.linspace(0, 1, steps=128, device=ray_bundle.origins.device)  # Adjust sampling logic
-        points = ray_bundle.origins[:, None, :] + t_vals[:, None] * ray_bundle.directions[:, None, :]
-
-        # Get outputs with uncertainty
-        output_fn = get_output_fn(self.pipeline.model)
-        outputs = output_fn(self.pipeline.model, ray_bundle)
-
-        # Compute uncertainty using gradients
-        offsets = outputs.get("uncertainty", None)
+        # Compute uncertainty
         aabb = self.pipeline.model.scene_box.aabb.to(self.device)
         uncertainty_calculator = ComputeUncertainty(load_config=None, aabb=aabb, device=self.device)
+        output_fn = uncertainty_calculator.get_output_fn(self.pipeline.model)
+        outputs, points, offsets = output_fn(ray_bundle, self.pipeline.model)
+
+        # Detach uncertainty to prevent graph reuse
         uncertainty = uncertainty_calculator.find_uncertainty(
             points, offsets, outputs['rgb'], self.pipeline.model.field.spatial_distortion
-        )
+        ).detach()
 
         # Log uncertainty metrics
         self.log_uncertainty_metrics(uncertainty, step)
 
-        # Combine uncertainty with other losses (e.g., RGB loss, depth loss)
+        # Combine uncertainty with other losses (detach uncertainty_loss to stop gradient tracking)
         rgb_loss = self.calculate_rgb_loss(outputs['rgb'], batch['image'])
-        uncertainty_loss = torch.mean(uncertainty)
+        uncertainty_loss = torch.mean(uncertainty).detach()  # Detach uncertainty_loss here
         total_loss = rgb_loss + self.config.uncertainty_weight * uncertainty_loss
 
+        print("RGB Loss requires grad:", rgb_loss.requires_grad)
+        print("Uncertainty Loss requires grad:", uncertainty_loss.requires_grad)
+
         # Backpropagation and optimization
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
+        optimizer = torch.optim.Adam(self.pipeline.model.parameters(), lr=1e-3)
+        optimizer.zero_grad()
+
+        print("Before backward pass")
+        total_loss.backward()  # Backpropagate once
+        print("After backward pass")
+
+        optimizer.step()
 
         return total_loss.detach()
 

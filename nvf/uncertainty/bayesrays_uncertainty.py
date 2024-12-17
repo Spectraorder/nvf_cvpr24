@@ -41,12 +41,27 @@ class ComputeUncertainty:
     lod: int = 8
     # number of iterations on the trainset    
     iters: int = 1000         
+
+    def __post_init__(self):
+        """Initialize attributes."""
+        self.hessian = torch.zeros(((2**self.lod) + 1)**3).to(self.device)
+        self.deform_field = HashEncoding(
+            num_levels=1,
+            min_res=2**self.lod,
+            max_res=2**self.lod,
+            log2_hashmap_size=self.lod * 3 + 1,  # Simple regular grid
+            features_per_level=3,
+            hash_init_scale=0.0,
+            implementation="torch",
+            interpolation="Linear",
+        ).to(self.device)
+        self.deform_field.scalings = torch.tensor([2**self.lod]).to(self.device)
     
     def find_uncertainty(self, points, deform_points, rgb, distortion):
-        if deform_points.shape[-1] == 1:
-            deform_points = deform_points.expand(-1, 3).clone().detach().requires_grad_(True)
-        else:
-            deform_points = deform_points.clone().detach().requires_grad_(True)
+        # if deform_points.shape[-1] == 1:
+        #     deform_points = deform_points.expand(-1, 3).clone().detach().requires_grad_(True)
+        # else:
+        #     deform_points = deform_points.clone().detach().requires_grad_(True)
         inds, coeffs = find_grid_indices(points, self.aabb, distortion, self.lod, self.device)
         #because deformation params are detached for each point on each ray from the grid, summation does not affect derivative
 
@@ -54,8 +69,8 @@ class ComputeUncertainty:
         linked_rgb = rgb + deform_points.sum() * 0.0
         colors = torch.sum(linked_rgb, dim=0)
         colors[0].backward(retain_graph=True)
-        print("Shape of deform_points:", deform_points.shape)
-        print("Shape of deform_points.grad:", deform_points.grad.shape)
+        # print("Shape of deform_points:", deform_points.shape)
+        # print("Shape of deform_points.grad:", deform_points.grad.shape)
         r = deform_points.grad.clone().detach().view(-1,3)
         deform_points.grad.zero_()
         colors[1].backward(retain_graph=True)
